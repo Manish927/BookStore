@@ -1,23 +1,43 @@
-//
-// Created by manish on 10/3/25.
-//
-
 #include "BookStoreRepo.h"
 
 #include <iostream>
 #include <regex>
 #include <sstream>
 
-std::string BookStoreRepo::fetchBook(std::string& book_id) {
+std::vector<std::string> BookStoreRepo::fetchBook(std::string& book_id) {
     std::cout << "BookStoreRepo::fetchBook " << book_id << std::endl;
-    //std::vector<sw::redis::OptionalString> vals;
-    sw::redis::OptionalString val = conn.hget("book_hash" ,book_id);
-    std::cout << "BookStoreRepo::fetchBook " << val.value_or("null") << std::endl;
-    return val.value_or("null");
+    std::vector<std::string> books = {};
+
+    try {
+
+        auto pipe = conn.pipeline(false);
+        auto replies = pipe.hgetall(book_id).exec();
+        replies.get(0, std::back_inserter(books));
+
+        for (auto& value : books) {
+            std::cout << value << " ";
+        }
+        std::cout << std::endl;
+    } catch (const std::exception& e) {
+        std::cout << e.what() << std::endl;
+    }
+    return books;
 }
 
 void BookStoreRepo::displayBooks() {
     std::unordered_map<std::string, std::string> books;
+    std::vector<std::string> keys;
+    try {
+        auto pipe = conn.pipeline(false);
+        auto replies = pipe.keys("book-isbn*").exec();
+        replies.get(0, std::back_inserter(keys));
+        for (auto& value : keys) {
+            std::vector<std::string>  temp = fetchBook(value);
+        }
+    } catch (const std::exception& e) {
+        std::cout << e.what() << std::endl;
+    }
+
     conn.hgetall("book_hash", std::inserter(books, books.begin()));
 
     std::for_each(books.begin(), books.end(),
@@ -37,48 +57,71 @@ std::string BookStoreRepo::storeBook(Book& obj) {
     return buffer;
 }
 
-bool BookStoreRepo::updateBook(std::string& book_id, std::unordered_map<std::string,std::string>& fields) {
+void BookStoreRepo::updateBook(std::string& book_id, std::unordered_map<std::string,std::string>& fields) {
     std::cout << "BookStoreRepo::updateBook " << book_id << std::endl;
-    std::vector<std::string> to_update;
+    std::unordered_map<std::string, std::string> updated_books = {};
 
-    if (std::string val = fetchBook(book_id); val != "null") {
-        std::string delimiter(":");
-        std::size_t pos = 0;
-        std::string token;
-        while ((pos = val.find(delimiter)) != std::string::npos) {
-            token = val.substr(0, pos);
-            to_update.push_back(token);
-            val.erase(0, pos + delimiter.length());
+    std::unordered_map<std::string, std::string> values = {};
+    try {
+        auto tx = conn.transaction();
+        auto redis = tx.redis();
+
+        while (true) {
+            redis.watch(book_id);
+            redis.hgetall(book_id, std::inserter(values, values.begin()));
+
+            if (values.size() > 0) {
+                updated_books.insert(fields.begin(), fields.end());
+                updated_books.insert(values.begin(), values.end());
+                auto replies = tx.hset(book_id, updated_books.begin(), updated_books.end()).exec();
+            }
+            else {
+                std::cout << "No updated books" << std::endl;
+            }
+            break;
         }
-        to_update.push_back(val);
-        Book obj;
-        obj.set_title(to_update[0]).set_author(to_update[1]).set_publisher(to_update[2])
-        .set_genre(to_update[3]).set_rating(std::stof(to_update[4])).set_page(std::stoi(to_update[5])).set_price(std::stof(to_update[6]));
 
-        for ( auto& [key, val] : fields) {
-            if (key == "title") { obj.set_title(val); }
-            if (key == "author") { obj.set_author(val); }
-            if (key == "publisher") { obj.set_publisher(val); }
-            if (key == "genre") { obj.set_genre(val); }
-            if (key == "rating") { obj.set_rating(std::stof(val)); }
-            if (key == "page") { obj.set_page(std::stoi(val)); }
-            if (key == "price") { obj.set_isbn(val); }
-        }
-        deleteBook(book_id);
-        std::cout << "Updated: " << storeBook(obj);
-
+    } catch (const sw::redis::WatchError &err) {
+        std::cout << err.what() << std::endl;
+        std::cout << "Probably keys has been modified outside " << book_id << std::endl;
     }
-
-    return true;
+    catch (const std::exception& e) {
+        std::cout << e.what() << std::endl;
+    }
 }
-bool BookStoreRepo::deleteBook(std::string& book_id) {
-    std::cout << "BookStoreRepo::deleteBook " << book_id << std::endl;
-    conn.hdel("book_hash" ,book_id);
-    return true;
+
+
+// delete entire book details
+void BookStoreRepo::deleteBook(std::string& isbn) {
+    std::cout << "BookStoreRepo::deleteBook " << isbn << std::endl;
+    try {
+        auto pipe = conn.pipeline(false);
+        pipe.del(isbn).exec();
+        pipe.discard();
+    } catch (std::exception& e) {
+        std::cout << e.what() << std::endl;
+    }
+}
+
+void BookStoreRepo::store_book(const std::string& isbn, const std::unordered_map<std::string, std::string>& data) {
+    std::cout << isbn << std::endl;
+
+    try {
+        auto pipe = conn.pipeline(false);
+        pipe.hset(isbn, data.begin(), data.end()).exec();
+        pipe.discard();
+    } catch (const std::exception& e) {
+        std::cout << e.what() << std::endl;
+    }
 }
 
 BookStoreRepo::BookStoreRepo(const std::string& path):PersistenceBaseRepo(path) {
     std::cout << "BookStoreRepo::BookStoreRepo created" << std::endl;
+}
+
+BookStoreRepo::BookStoreRepo(const sw::redis::ConnectionOptions& opts, const sw::redis::ConnectionPoolOptions& pool_opts)
+     :PersistenceBaseRepo(opts, pool_opts) {
+    std::cout << "BookStoreRepo::BookStoreRepo created: " <<std::endl;
 }
 
 BookStoreRepo::~BookStoreRepo() {
